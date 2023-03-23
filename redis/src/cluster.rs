@@ -133,6 +133,7 @@ pub struct ClusterConnection<C = Connection> {
     write_timeout: RefCell<Option<Duration>>,
     tls: Option<TlsMode>,
     retries: u32,
+    host: RefCell<String>,
 }
 
 impl<C> ClusterConnection<C>
@@ -155,6 +156,7 @@ where
             tls: cluster_params.tls,
             initial_nodes: initial_nodes.to_vec(),
             retries: cluster_params.retries,
+            host: RefCell::new(String::new()),
         };
         connection.create_initial_connections()?;
 
@@ -298,11 +300,13 @@ where
         let mut new_slots = None;
         let mut rng = thread_rng();
         let len = connections.len();
-        let mut samples = connections.values_mut().choose_multiple(&mut rng, len);
+        let mut samples = connections.iter_mut().choose_multiple(&mut rng, len);
 
-        for conn in samples.iter_mut() {
+        for (key, conn) in samples.iter_mut() {
             let value = conn.req_command(&slot_cmd())?;
-            if let Ok(mut slots_data) = parse_slots(value, self.tls) {
+            let host = key.split_once(':').unwrap().0;
+            if let Ok(mut slots_data) = parse_slots(value, self.tls, host) {
+                *self.host.borrow_mut() = host.to_string();
                 slots_data.sort_by_key(|s| s.start());
                 let last_slot = slots_data.iter().try_fold(0, |prev_end, slot_data| {
                     if prev_end != slot_data.start() {
@@ -519,7 +523,13 @@ where
                         let kind = err.kind();
 
                         if kind == ErrorKind::Ask {
-                            redirected = err.redirect_node().map(|(node, _slot)| node.to_string());
+                            redirected = err.redirect_node().map(|(node, _slot)| {
+                                if node.starts_with("127.0.0.1:") {
+                                    node.replace("127.0.0.1:", &format!("{}:", self.host.borrow()))
+                                } else {
+                                    node.to_string()
+                                }
+                            });
                             is_asking = true;
                         } else if kind == ErrorKind::Moved {
                             // Refresh slots.
@@ -527,7 +537,13 @@ where
                             excludes.clear();
 
                             // Request again.
-                            redirected = err.redirect_node().map(|(node, _slot)| node.to_string());
+                            redirected = err.redirect_node().map(|(node, _slot)| {
+                                if node.starts_with("127.0.0.1:") {
+                                    node.replace("127.0.0.1:", &format!("{}:", self.host.borrow()))
+                                } else {
+                                    node.to_string()
+                                }
+                            });
                             is_asking = false;
                             continue;
                         } else if kind == ErrorKind::TryAgain || kind == ErrorKind::ClusterDown {
@@ -748,7 +764,11 @@ fn get_random_connection<'a, C: ConnectionLike + Connect + Sized>(
 }
 
 // Parse slot data from raw redis value.
-pub(crate) fn parse_slots(raw_slot_resp: Value, tls: Option<TlsMode>) -> RedisResult<Vec<Slot>> {
+pub(crate) fn parse_slots(
+    raw_slot_resp: Value,
+    tls: Option<TlsMode>,
+    host: &str,
+) -> RedisResult<Vec<Slot>> {
     // Parse response.
     let mut result = Vec::with_capacity(2);
 
@@ -780,7 +800,7 @@ pub(crate) fn parse_slots(raw_slot_resp: Value, tls: Option<TlsMode>) -> RedisRe
                             return None;
                         }
 
-                        let ip = if let Value::Data(ref ip) = node[0] {
+                        let mut ip = if let Value::Data(ref ip) = node[0] {
                             String::from_utf8_lossy(ip)
                         } else {
                             return None;
@@ -788,7 +808,11 @@ pub(crate) fn parse_slots(raw_slot_resp: Value, tls: Option<TlsMode>) -> RedisRe
                         if ip.is_empty() {
                             return None;
                         }
-
+                        if ip == "127.0.0.1" {
+                            let temp = ip.to_mut();
+                            temp.clear();
+                            temp.push_str(host);
+                        }
                         let port = if let Value::Int(port) = node[1] {
                             port as u16
                         } else {
