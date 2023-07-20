@@ -408,7 +408,7 @@ where
 
         async move {
             let mut result = Ok(SlotMap::new());
-            for (_, conn) in connections.iter_mut() {
+            for (key, conn) in connections.iter_mut() {
                 let mut conn = conn.clone().await;
                 let value = match conn.req_packed_command(&slot_cmd()).await {
                     Ok(value) => value,
@@ -417,7 +417,8 @@ where
                         continue;
                     }
                 };
-                match parse_slots(value, cluster_params.tls)
+                let host = key.split_once(':').unwrap().0;
+                match parse_slots(value, cluster_params.tls, host)
                     .and_then(|v| Self::build_slot_map(v, cluster_params.read_from_replicas))
                 {
                     Ok(s) => {
